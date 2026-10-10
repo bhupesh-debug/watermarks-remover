@@ -55,6 +55,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+import mimetypes
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -932,9 +933,10 @@ def _parse_clean_options(options: Any) -> dict[str, Any]:
     # A per-request strategy overrides the default; validate it up front so a bad
     # tactic/intensity is a 400 rather than a mid-clean failure.
     if "strategy" in options:
-        from rewrite_text import parse_strategy
+        if options["strategy"] not in ("none", "skip", "layer_a"):
+            from rewrite_text import parse_strategy
 
-        parse_strategy(options["strategy"])
+            parse_strategy(options["strategy"])
     return options
 
 
@@ -1252,17 +1254,18 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
                 aggressive_homoglyphs=bool(options.get("aggressive_homoglyphs")),
                 normalize_spaces=bool(options.get("normalize_spaces", True)),
             )
-            # Layer B is a required step for text cleaning: always apply the
-            # default (or per-request) rewrite strategy and reject (400) when no
-            # strategy is available or a step's backend/model can't run.
-            strategy = options.get("strategy") or _DEFAULT_STRATEGY
-            if not strategy:
-                raise ValueError(
-                    "Layer B rewrite is required for text cleaning; configure a "
-                    "default strategy (config/clean_strategy.json) or pass "
-                    "options.strategy"
-                )
-            cleaned, layer_b = _apply_layer_b(cleaned, strategy, options)
+            strategy = options.get("strategy")
+            if strategy in ("none", "skip", "layer_a"):
+                layer_b = {"skipped": True, "reason": "Layer A only requested"}
+            else:
+                strategy = strategy or _DEFAULT_STRATEGY
+                if not strategy:
+                    raise ValueError(
+                        "Layer B rewrite is required for text cleaning; configure a "
+                        "default strategy (config/clean_strategy.json) or pass "
+                        "options.strategy"
+                    )
+                cleaned, layer_b = _apply_layer_b(cleaned, strategy, options)
             if detect_after:
                 detector_reports["after"] = run_text_detectors(cleaned)
             cleaned_bytes = cleaned.encode("utf-8", errors="surrogateescape")
@@ -1445,8 +1448,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
         self.wfile.write(data)
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
@@ -1460,7 +1474,36 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/openapi.json":
             self._respond(HTTPStatus.OK, openapi_spec())
         else:
-            self._respond(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
+            # Check for web app UI static assets
+            web_roots = [
+                Path(__file__).resolve().parent.parent.parent / "web",
+                Path(__file__).resolve().parent.parent.parent,
+            ]
+            served = False
+            for root_dir in web_roots:
+                if not root_dir.is_dir():
+                    continue
+                req_file = "index.html" if path in ("/", "/index.html", "/app") else path.lstrip("/")
+                try:
+                    candidate = (root_dir / req_file).resolve()
+                    if candidate.is_file() and (root_dir in candidate.parents or candidate == root_dir / req_file):
+                        content_type, _ = mimetypes.guess_type(str(candidate))
+                        content_type = content_type or "application/octet-stream"
+                        if content_type.startswith("text/") or content_type in ("application/javascript", "application/json"):
+                            content_type += "; charset=utf-8"
+                        data = candidate.read_bytes()
+                        self.send_response(HTTPStatus.OK)
+                        self.send_header("Content-Type", content_type)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        self.wfile.write(data)
+                        served = True
+                        break
+                except Exception:
+                    pass
+            if not served:
+                self._respond(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
